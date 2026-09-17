@@ -1,4 +1,4 @@
-from nova.ui_v2 import launch
+from nova.ui_v15 import launch
 
 
 if __name__ == "__main__":
