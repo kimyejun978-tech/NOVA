@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 
@@ -37,12 +38,21 @@ def _version_tuple(text: str) -> tuple[int, ...]:
     return tuple((out + [0, 0, 0])[:3])
 
 
+def _headers(accept: str | None = None) -> dict[str, str]:
+    headers = {
+        "User-Agent": f"NOVA/{APP_VERSION} (Windows; updater)",
+        "Cache-Control": "no-cache",
+    }
+    if accept:
+        headers["Accept"] = accept
+    return headers
+
+
 def _request_json(url: str) -> dict:
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": f"NOVA/{APP_VERSION}",
-            "Accept": "application/vnd.github+json",
+            **_headers("application/vnd.github+json"),
             "X-GitHub-Api-Version": "2022-11-28",
         },
     )
@@ -50,19 +60,83 @@ def _request_json(url: str) -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 
+def _release_version_from_web() -> str:
+    """Resolve GitHub's public /releases/latest redirect without using the REST API."""
+    url = f"https://github.com/{UPDATE_OWNER}/{UPDATE_REPO}/releases/latest"
+    req = urllib.request.Request(url, headers=_headers("text/html,application/xhtml+xml"))
+    with urllib.request.urlopen(req, timeout=15) as response:
+        final_url = response.geturl()
+
+    marker = "/releases/tag/"
+    if marker not in final_url:
+        raise RuntimeError("GitHub latest Release 태그를 확인할 수 없습니다.")
+    tag = urllib.parse.unquote(final_url.split(marker, 1)[1]).split("?", 1)[0].strip("/")
+    if not tag:
+        raise RuntimeError("GitHub latest Release 태그가 비어 있습니다.")
+    return tag.lstrip("vV")
+
+
+def _release_version_from_raw() -> str:
+    """Last-resort fallback for networks where the release redirect is blocked."""
+    url = f"https://raw.githubusercontent.com/{UPDATE_OWNER}/{UPDATE_REPO}/main/VERSION"
+    req = urllib.request.Request(url, headers=_headers("text/plain"))
+    with urllib.request.urlopen(req, timeout=15) as response:
+        version = response.read().decode("utf-8", errors="replace").strip()
+    if not version:
+        raise RuntimeError("VERSION 파일이 비어 있습니다.")
+    return version.lstrip("vV")
+
+
+def _fallback_update_info(reason: str = "") -> UpdateInfo:
+    errors: list[str] = []
+    try:
+        latest_version = _release_version_from_web()
+    except Exception as e:
+        errors.append(f"release redirect: {e}")
+        try:
+            latest_version = _release_version_from_raw()
+        except Exception as raw_error:
+            errors.append(f"raw VERSION: {raw_error}")
+            detail = "; ".join(errors)
+            if reason:
+                detail = f"{reason}; {detail}"
+            raise RuntimeError(f"업데이트 확인 실패: {detail}") from raw_error
+
+    tag = f"v{latest_version}"
+    asset_name = UPDATE_ASSET_EXE if bool(getattr(sys, "frozen", False)) else UPDATE_ASSET_SOURCE
+    base = f"https://github.com/{UPDATE_OWNER}/{UPDATE_REPO}/releases/download/{tag}"
+    release_url = f"https://github.com/{UPDATE_OWNER}/{UPDATE_REPO}/releases/tag/{tag}"
+    return UpdateInfo(
+        available=_version_tuple(latest_version) > _version_tuple(APP_VERSION),
+        version=latest_version,
+        current_version=APP_VERSION,
+        title=f"NOVA {tag}",
+        notes=(
+            "GitHub API 제한을 우회한 안전한 fallback 경로로 업데이트 정보를 확인했습니다."
+            if reason
+            else ""
+        ),
+        download_url=f"{base}/{asset_name}",
+        sha256_url=f"{base}/{asset_name}.sha256",
+        api_digest=None,
+        release_url=release_url,
+        asset_name=asset_name,
+    )
+
+
 def check_latest() -> UpdateInfo:
+    """Check latest release. GitHub REST is preferred, but never required."""
     url = f"https://api.github.com/repos/{UPDATE_OWNER}/{UPDATE_REPO}/releases/latest"
     try:
         payload = _request_json(url)
     except urllib.error.HTTPError as e:
-        if e.code == 404:
-            raise RuntimeError(
-                f"업데이트 저장소 {UPDATE_OWNER}/{UPDATE_REPO} 또는 Release를 찾을 수 없습니다. "
-                "GitHub 저장소를 만든 뒤 Release를 게시하면 자동 업데이트가 활성화됩니다."
-            ) from e
-        raise RuntimeError(f"업데이트 확인 HTTP 오류: {e.code}") from e
+        # Public GitHub REST requests can be rate-limited per IP (often HTTP 403/429).
+        # Do not fail the updater; use the normal public release pages instead.
+        return _fallback_update_info(f"GitHub API HTTP {e.code}")
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        return _fallback_update_info(f"GitHub API 연결 오류: {e}")
     except Exception as e:
-        raise RuntimeError(f"업데이트 확인 실패: {e}") from e
+        return _fallback_update_info(f"GitHub API 응답 오류: {e}")
 
     tag = str(payload.get("tag_name") or "0.0.0")
     latest_version = tag.lstrip("vV")
@@ -71,6 +145,12 @@ def check_latest() -> UpdateInfo:
     asset = next((a for a in assets if a.get("name") == asset_name), None)
     sha_asset = next((a for a in assets if a.get("name") == asset_name + ".sha256"), None)
 
+    # If GitHub returned metadata without the expected asset, still construct the
+    # stable public release URLs so a transient API metadata issue does not block updates.
+    base = f"https://github.com/{UPDATE_OWNER}/{UPDATE_REPO}/releases/download/v{latest_version}"
+    download_url = asset.get("browser_download_url") if asset else f"{base}/{asset_name}"
+    sha256_url = sha_asset.get("browser_download_url") if sha_asset else f"{base}/{asset_name}.sha256"
+
     available = _version_tuple(latest_version) > _version_tuple(APP_VERSION)
     return UpdateInfo(
         available=available,
@@ -78,18 +158,23 @@ def check_latest() -> UpdateInfo:
         current_version=APP_VERSION,
         title=str(payload.get("name") or tag),
         notes=str(payload.get("body") or ""),
-        download_url=asset.get("browser_download_url") if asset else None,
-        sha256_url=sha_asset.get("browser_download_url") if sha_asset else None,
+        download_url=download_url,
+        sha256_url=sha256_url,
         api_digest=asset.get("digest") if asset else None,
-        release_url=payload.get("html_url"),
+        release_url=payload.get("html_url") or f"https://github.com/{UPDATE_OWNER}/{UPDATE_REPO}/releases/tag/v{latest_version}",
         asset_name=asset_name,
     )
 
 
 def _download(url: str, target: Path) -> None:
-    req = urllib.request.Request(url, headers={"User-Agent": f"NOVA/{APP_VERSION}"})
-    with urllib.request.urlopen(req, timeout=60) as response, target.open("wb") as out:
-        shutil.copyfileobj(response, out)
+    req = urllib.request.Request(url, headers=_headers("application/octet-stream"))
+    try:
+        with urllib.request.urlopen(req, timeout=60) as response, target.open("wb") as out:
+            shutil.copyfileobj(response, out)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"업데이트 파일 다운로드 HTTP 오류: {e.code}") from e
+    except Exception as e:
+        raise RuntimeError(f"업데이트 파일 다운로드 실패: {e}") from e
 
 
 def _sha256(path: Path) -> str:
