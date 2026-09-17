@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import QApplication, QFrame, QLabel, QGraphicsDropShadowEffect
 
 from .config import APP_NAME
@@ -224,18 +223,16 @@ class MainWindow(previous.MainWindow):
         for frame in self.findChildren(QFrame, "HeroCard"):
             frame.setMinimumHeight(118)
 
-        # Subtle depth only for neutral white cards, not for the bright metric cards.
+        # Subtle depth only for neutral white cards, not for bright metric cards.
         for frame in self.findChildren(QFrame, "Card"):
             shadow = QGraphicsDropShadowEffect(frame)
             shadow.setBlurRadius(22)
             shadow.setOffset(0, 4)
-            from PySide6.QtGui import QColor
             shadow.setColor(QColor(0, 0, 0, 16))
             frame.setGraphicsEffect(shadow)
 
-        if hasattr(self, "kill_badge"):
-            self.kill_badge.setText("Safety armed")
-
+        # Re-read the real hard safety state so the single visible badge is accurate.
+        self.refresh_safety()
         self.statusBar().showMessage("NOVA · paper trading environment")
 
     def refresh_safety(self):
