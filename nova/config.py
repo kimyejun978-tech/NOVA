@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 APP_NAME = "NOVA"
-APP_VERSION = "1.5"
+APP_VERSION = "1.5.1"
 
 DATA_DIR = Path(os.getenv("LOCALAPPDATA", Path.home())) / APP_NAME
 DATA_DIR.mkdir(parents=True, exist_ok=True)
