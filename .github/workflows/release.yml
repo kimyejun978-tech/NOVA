@@ -1,0 +1,131 @@
+name: Build and publish NOVA
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install test dependencies
+        run: python -m pip install --upgrade pip pytest numpy pandas scikit-learn
+      - name: Verify version and syntax
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          version = Path('VERSION').read_text(encoding='utf-8').strip()
+          config = Path('nova/config.py').read_text(encoding='utf-8')
+          match = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', config)
+          assert match and match.group(1) == version, f'VERSION={version}, config={match.group(1) if match else None}'
+          PY
+          python -m compileall -q nova main.py nova_updater.py
+      - name: Run tests
+        run: pytest -q
+
+  source-package:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build source update package
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import hashlib
+          import zipfile
+
+          root = Path('.').resolve()
+          out_dir = root / 'artifacts'
+          out_dir.mkdir(exist_ok=True)
+          zip_path = out_dir / 'NOVA-Source.zip'
+          excluded_dirs = {'.git', '.github', '.venv', 'build', 'dist', 'release', 'artifacts', '__pycache__', '.pytest_cache'}
+
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+              for path in root.rglob('*'):
+                  if not path.is_file():
+                      continue
+                  rel = path.relative_to(root)
+                  if any(part in excluded_dirs for part in rel.parts):
+                      continue
+                  if path.suffix in {'.pyc', '.spec'}:
+                      continue
+                  zf.write(path, rel.as_posix())
+
+          digest = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          (out_dir / 'NOVA-Source.zip.sha256').write_text(f'{digest}  NOVA-Source.zip\n', encoding='ascii')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: source-release
+          path: artifacts/NOVA-Source.zip*
+          if-no-files-found: error
+
+  windows-package:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install application dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+      - name: Build NOVA and standalone updater
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean --onefile --windowed --name NOVAUpdater nova_updater.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pyinstaller --noconfirm --clean --windowed --name NOVA --collect-all sklearn --collect-all yfinance main.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item -Force 'dist\NOVAUpdater.exe' 'dist\NOVA\NOVAUpdater.exe'
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          Compress-Archive -Path 'dist\NOVA\*' -DestinationPath 'artifacts\NOVA-Windows.zip' -CompressionLevel Optimal -Force
+          $hash = (Get-FileHash 'artifacts\NOVA-Windows.zip' -Algorithm SHA256).Hash.ToLower()
+          Set-Content -Path 'artifacts\NOVA-Windows.zip.sha256' -Value ($hash + '  NOVA-Windows.zip') -Encoding ascii
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: artifacts/NOVA-Windows.zip*
+          if-no-files-found: error
+
+  publish:
+    needs: [source-package, windows-package]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '*-release'
+          path: release-assets
+          merge-multiple: true
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="$(tr -d '\r\n' < VERSION)"
+          TAG="v${VERSION}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "NOVA ${TAG}" --latest
+          else
+            gh release create "$TAG" --target "$GITHUB_SHA" --title "NOVA ${TAG}" --notes "Automated NOVA ${TAG} build. Includes source and Windows update packages with SHA-256 checksums." --latest
+          fi
+          gh release upload "$TAG" \
+            release-assets/NOVA-Source.zip \
+            release-assets/NOVA-Source.zip.sha256 \
+            release-assets/NOVA-Windows.zip \
+            release-assets/NOVA-Windows.zip.sha256 \
+            --clobber
