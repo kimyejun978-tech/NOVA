@@ -31,7 +31,9 @@ jobs:
           PY
           python -m compileall -q nova main.py nova_updater.py
       - name: Run tests
-        run: pytest -q
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -m pytest -q
 
   source-package:
     needs: test
